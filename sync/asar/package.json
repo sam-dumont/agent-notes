@@ -1,0 +1,8 @@
+{
+  "name": "agent-notes-asar",
+  "private": true,
+  "description": "Pinned extractor for Obsidian's app bundle (sync/obsidian-fetch.sh), installed with npm ci --ignore-scripts from the lockfile",
+  "dependencies": {
+    "@electron/asar": "4.3.1"
+  }
+}

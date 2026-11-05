@@ -1,0 +1,57 @@
+; CouchDB for agent-notes. Rendered from this template by the deployment
+; (deploy/compose: render_config.py; deploy/terraform: templatefile), into
+; default.d so the image's local.d (admin hash, cookie secret) still applies.
+; Placeholders: uuid, database and jwt_keys (one line per device).
+
+[couchdb]
+single_node = true
+; Fixed so a rebuilt container keeps the same identity (replication checkpoints).
+uuid = ${uuid}
+; LiveSync's recommended limits: chunks are small, attachments are not.
+max_document_size = 50000000
+
+[cluster]
+n = 1
+
+[chttpd]
+bind_address = 0.0.0.0
+require_valid_user = true
+; /_up for health checks, nothing else, without a login.
+require_valid_user_except_for_up = true
+max_http_request_size = 4294967296
+enable_cors = true
+; JWT for the devices (one key per device below); basic for the LiveSync
+; daemon and the setup job on the internal network. No proxy auth, no
+; cookie sessions: the gate (sync/gate.Caddyfile) only ever forwards Bearer
+; requests from outside.
+authentication_handlers = {chttpd_auth, jwt_authentication_handler}, {chttpd_auth, default_authentication_handler}
+
+[jwt_auth]
+required_claims = exp
+; LiveSync signs every token with "_couchdb.roles": ["_admin"], hard-coded
+; (its _jwtParams; the only claim it lets you set is sub). CouchDB's default
+; reads the roles from that claim, which made every device a server admin.
+; Read them from sub instead: a device is the user JWT_SUB with the role
+; JWT_SUB, a member of the ${database} database (couchdb-setup.sh) and
+; nothing more, so CouchDB itself refuses design documents (even inside a
+; _bulk_docs body, which the gate can't read), _config, _users, _all_dbs and
+; other databases. roles_claim_path, not the deprecated roles_claim_name: a
+; release that drops the old key would silently fall back to "_couchdb.roles".
+; Limit: whoever holds a device's private key can sign sub="x,_admin" (a sub
+; is split on commas into roles); the key never leaves the device, the
+; tokens do (5 minutes each). lab/compose/e2e.sh step 4b checks all this.
+roles_claim_path = sub
+
+; One ES256 public key per device (scripts/device-key.sh). The gate keeps
+; devices on the ${database} database too. Removing a line revokes a device
+; (restart CouchDB).
+[jwt_keys]
+${jwt_keys}
+
+; Obsidian desktop, iOS and Android.
+[cors]
+origins = app://obsidian.md,capacitor://localhost,http://localhost
+credentials = true
+headers = accept, authorization, content-type, origin, referer
+methods = GET, PUT, POST, HEAD, DELETE
+max_age = 3600

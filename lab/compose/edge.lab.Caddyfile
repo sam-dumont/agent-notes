@@ -1,0 +1,21 @@
+{
+	admin off
+	local_certs
+	skip_install_trust
+}
+sync.test {
+	tls internal
+	reverse_proxy gate:5985
+}
+mcp.test {
+	tls internal
+	reverse_proxy mcp:8000
+}
+idp.test {
+	tls internal
+	reverse_proxy idp:8080
+}
+web.test {
+	tls internal
+	reverse_proxy oauth2-proxy:4180
+}

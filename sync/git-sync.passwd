@@ -1,0 +1,2 @@
+root:x:0:0:root:/root:/sbin/nologin
+git-sync:x:1000:1000:agent-notes git-sync:/tmp:/sbin/nologin

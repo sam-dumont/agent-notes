@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/agent-notes/hooks/agent_notes_hooks.py start",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/agent-notes/hooks/agent_notes_hooks.py end",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/agent-notes/hooks/agent_notes_hooks.py checkpoint",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/agent-notes/hooks/agent_notes_hooks.py checkpoint --force",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "notes": {
+      "type": "http",
+      "url": "https://notes-mcp.example.com/mcp",
+      "headersHelper": "~/agent-notes/hooks/mcp-device-header"
+    }
+  }
+}

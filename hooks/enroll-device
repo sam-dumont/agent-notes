@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Enroll this machine for agent-notes: create its ES256 key and print the public key.
+
+  hooks/enroll-device            uses [device] in hooks.toml (or the AGENT_NOTES_DEVICE_* env)
+
+The private key goes straight to the macOS Keychain (through `security -i` on stdin) or to a
+mode-600 file; it is never printed, never on a command line. Refuses to replace an existing
+key: revoke first (remove it from AGENT_NOTES_DEVICE_KEYS, then delete the Keychain item or
+the file). Paste the printed JSON entry into AGENT_NOTES_DEVICE_KEYS on the server.
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import device_token as dt  # noqa: E402
+
+
+def main() -> int:
+    cfg = dt.DeviceConfig.load()
+    if dt.key_exists(cfg):
+        print(f"a key for {cfg.kid!r} already exists ({cfg.key}); revoke it before enrolling again", file=sys.stderr)
+        return 1
+    pem = dt.generate_key()
+    dt.store_key(cfg, pem)
+    pub = dt.public_pem(dt.load_key(cfg))
+    where = "the Keychain" if cfg.key == "keychain" else str(cfg.key_file)
+    print(f"Enrolled {cfg.kid!r}: private key in {where}.\n")
+    print("Public key, for AGENT_NOTES_DEVICE_KEYS on the server (merge with any existing entries):\n")
+    print(json.dumps({cfg.kid: pub}))
+    if not cfg.servers:
+        print("\nNo [device.servers] configured yet: mcp-device-header sends nothing until you list the server.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

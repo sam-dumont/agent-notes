@@ -1,0 +1,119 @@
+# Tests on every pull request and push: the server's unit tests, the shell
+# scripts, the configs, a secret scan, and the three end-to-end runs of the
+# lab (lab/README.md): Docker Compose, Docker Compose with Obsidian in a
+# browser, and the Terraform module on a throwaway kind cluster.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Unit tests
+        working-directory: server
+        run: uv run --frozen pytest -q
+      - name: Inbox reviewer (offline)
+        run: python3 reviewer/test_inbox_review.py
+      - name: Hooks
+        working-directory: server
+        run: uv run --frozen --with pytest pytest -q ../hooks/test_hooks.py
+      - name: Locked requirements match uv.lock
+        working-directory: server
+        run: |
+          uv export -q --frozen --no-dev --no-emit-project -o /tmp/req.txt
+          uv export -q --frozen --only-group dev --no-emit-project -o /tmp/req-dev.txt
+          diff <(grep -v '^#' requirements.txt) <(grep -v '^#' /tmp/req.txt)
+          diff <(grep -v '^#' requirements-dev.txt) <(grep -v '^#' /tmp/req-dev.txt)
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src \
+            docker.io/koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
+            sync/*.sh scripts/*.sh lab/compose/e2e.sh lab/kind/run.sh
+      - name: Compose file is valid
+        working-directory: deploy/compose
+        run: |
+          cp .env.example .env && ../../scripts/init-env.sh .env >/dev/null
+          sed -i 's/^OIDC_CLIENT_ID=$/OIDC_CLIENT_ID=x/; s/^OIDC_CLIENT_SECRET=$/OIDC_CLIENT_SECRET=x/; s/^AGENT_NOTES_ALLOWED_SUBS=$/AGENT_NOTES_ALLOWED_SUBS=x/' .env
+          docker compose --profile edge --profile web --profile github-app config -q
+      - name: Secret scan
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" \
+            docker.io/zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --redact --no-banner
+
+  terraform:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with: { terraform_wrapper: false }
+      - run: terraform fmt -check -recursive deploy/terraform
+      - working-directory: deploy/terraform/examples/basic
+        run: terraform init -backend=false -input=false && terraform validate
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: [server]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }
+      # e2e.sh signs device tokens with the server's environment (PyJWT).
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: End-to-end (Docker Compose)
+        run: lab/compose/e2e.sh
+
+  e2e-web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [server]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: End-to-end with Obsidian in a browser (downloads Obsidian)
+        run: lab/compose/e2e.sh
+        env: { E2E_WEB: "1" }
+
+  kind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [server]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with: { terraform_wrapper: false }
+      - name: kind (pinned, checksum verified)
+        run: |
+          curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c -
+          sudo install -m 0755 kind /usr/local/bin/kind && rm kind
+      - name: The Terraform module on a throwaway kind cluster
+        run: lab/kind/run.sh

@@ -1,0 +1,12 @@
+# agent-notes
+
+> Shared Markdown notes for AI agents and Obsidian: an MCP server with access tiers and owner-approved elevation, Obsidian sync (Self-hosted LiveSync), git history, any OIDC provider. Docker Compose or Terraform (Kubernetes).
+
+If you are an LLM asked to deploy this, follow AGENTS.md: it is the step-by-step procedure, with what to ask the user, what to verify, and what never to do.
+
+- [AGENTS.md](AGENTS.md): how to build this, for LLM agents
+- [README.md](README.md): what it is, quick start
+- [docs/security.md](docs/security.md): threat model, tiers, elevation, the gate, known limits
+- [docs/oidc.md](docs/oidc.md): the OIDC client, proving a second factor
+- [docs/devices.md](docs/devices.md): Obsidian devices, Setup URIs, enrolled machines
+- [docs/operations.md](docs/operations.md): alerts, backups, upgrades, rotation
