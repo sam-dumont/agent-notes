@@ -1,0 +1,96 @@
+# The gate: the only way from outside to CouchDB and to Obsidian-in-a-browser.
+# Runs next to them (deploy/compose, deploy/terraform), behind your TLS edge.
+#
+# :5985 CouchDB, for Obsidian's LiveSync plugin. LiveSync's JWTs carry the
+# _admin role (hard-coded in the plugin); CouchDB ignores it and makes a device
+# a member of the notes database (couchdb.ini.tmpl, roles_claim_path). This
+# keeps it there from outside too: only Bearer requests (and CORS preflights)
+# to the notes database, never _security, another database, _users, _config
+# or Fauxton.
+#
+# :8081 Obsidian in a browser (Ignis), behind oauth2-proxy. Ignis has no login
+# of its own and lets the page create, rename or remove whole vaults: those
+# calls are refused here, in any case and with any number of slashes.
+{
+	admin off
+	auto_https off
+	servers {
+		# Only the edge talks to us; take the client address from it.
+		trusted_proxies static private_ranges
+	}
+}
+
+:5985 {
+	# Caddy matches paths decoded but forwards them raw: /notes%2Fevil would
+	# match /notes/* here and reach CouchDB as the database "notes/evil".
+	# Refuse every encoded slash, backslash and NUL before any other rule.
+	@encoded expression `{http.request.uri}.lowerAscii().contains("%2f") || {http.request.uri}.lowerAscii().contains("%5c") || {http.request.uri}.contains("%00")`
+	handle @encoded {
+		respond 403
+	}
+	# A device syncs documents; it never creates or drops the database, never
+	# writes design documents (a validate_doc_update can lock out every
+	# writer), and uses no other method.
+	@db_itself {
+		method PUT DELETE
+		path /{$COUCHDB_DATABASE} /{$COUCHDB_DATABASE}/
+	}
+	@design_write {
+		path /{$COUCHDB_DATABASE}/_design/* /{$COUCHDB_DATABASE}/_design
+		not method GET HEAD OPTIONS
+	}
+	@other_methods not method GET HEAD POST PUT DELETE OPTIONS
+	handle @db_itself {
+		respond 403
+	}
+	handle @design_write {
+		respond 403
+	}
+	handle @other_methods {
+		respond 403
+	}
+	@bearer {
+		header_regexp Authorization ^Bearer\s
+		path / /{$COUCHDB_DATABASE} /{$COUCHDB_DATABASE}/*
+		not path /{$COUCHDB_DATABASE}/_security /{$COUCHDB_DATABASE}/_security/*
+	}
+	@preflight {
+		method OPTIONS
+		path / /{$COUCHDB_DATABASE} /{$COUCHDB_DATABASE}/*
+	}
+	handle @preflight {
+		reverse_proxy {$COUCHDB_UPSTREAM}
+	}
+	handle @bearer {
+		# Basic auth or cookies never reach CouchDB from outside, even on an
+		# allowed path: only the device JWTs do.
+		request_header -Cookie
+		request_header -X-Auth-CouchDB-UserName
+		request_header -X-Auth-CouchDB-Roles
+		request_header -X-Auth-CouchDB-Token
+		reverse_proxy {$COUCHDB_UPSTREAM}
+	}
+	handle {
+		respond 403
+	}
+}
+
+:8081 {
+	# Express (Ignis) routes are case-insensitive: so is this.
+	@vault_admin path_regexp (?i)^/+api/+vault/+(create|rename|remove)
+	# Encoded slashes, backslashes and NULs in the PATH could slip a vault call
+	# past @vault_admin. Only the path: Ignis passes a note's path in the
+	# query (readFile?path=inbox%2Fcaptures%2Fnote.md), and refusing those
+	# made every note in a subfolder that arrived while the page was open
+	# fail to open (403, "Failed to open").
+	@encoded expression `{http.request.uri}.split("?")[0].lowerAscii().contains("%2f") || {http.request.uri}.split("?")[0].lowerAscii().contains("%5c") || {http.request.uri}.split("?")[0].contains("%00")`
+	handle @encoded {
+		respond 403
+	}
+	handle @vault_admin {
+		respond 403
+	}
+	handle {
+		reverse_proxy {$IGNIS_UPSTREAM}
+	}
+}

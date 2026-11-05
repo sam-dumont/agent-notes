@@ -1,0 +1,118 @@
+# End-to-end test overlay (lab/compose/e2e.sh). Never for production:
+# a mock OIDC provider, an SSH git host, TLS from Caddy's internal CA.
+services:
+  edge:
+    profiles: !reset []
+    ports: !reset []
+    volumes: !override
+      - ../../lab/compose/edge.lab.Caddyfile:/etc/caddy/Caddyfile:ro
+      - edge-data:/data
+      - edge-config:/config
+    networks:
+      internal:
+        aliases: [sync.test, mcp.test, idp.test, web.test]
+      egress: {}
+
+  idp:
+    image: ghcr.io/navikt/mock-oauth2-server:6.0.8@sha256:3a20ed622fdcd0d316cbb9868ebf5df10ae89440f6c136a89f23a3adccf99dbb
+    networks: [internal]
+    environment:
+      SERVER_PORT: "8080"
+      JSON_CONFIG: '{"interactiveLogin": false, "httpServer": "NettyWrapper", "tokenCallbacks": [{"issuerId": "default", "tokenExpiry": 3600, "requestMappings": [{"requestParam": "grant_type", "match": "*", "claims": {"sub": "owner-sub", "aud": ["agent-notes-test"], "email": "intruder@test.example", "email_verified": true}}]}]}'
+
+  mcp:
+    environment:
+      SSL_CERT_FILE: /ca/root.crt
+      REQUESTS_CA_BUNDLE: /ca/root.crt
+    networks: !override [internal]
+    volumes:
+      - ca:/ca:ro
+    depends_on:
+      ca: { condition: service_completed_successfully }
+
+  # Obsidian in a browser's SSO, without the web app itself: the check is that
+  # an account other than WEB_ALLOWED_EMAIL is refused after logging in.
+  oauth2-proxy:
+    profiles: !reset []
+    networks: !override [internal]
+    environment:
+      SSL_CERT_FILE: /ca/root.crt
+    volumes:
+      - ca:/ca:ro
+      - { type: volume, source: config, target: /etc/oauth2-proxy, read_only: true, volume: { subpath: web } }
+    depends_on:
+      ca: { condition: service_completed_successfully }
+      render: { condition: service_completed_successfully }
+
+  git-sync:
+    networks: !override [internal]
+
+  # The git host: SSH only, one deploy key, git-shell. Stands in for GitHub,
+  # Gitea, Forgejo... (replace with yours: lab/README.md).
+  git-server:
+    build:
+      dockerfile_inline: |
+        FROM docker.io/library/alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
+        RUN apk add --no-cache openssh-server git \
+         && adduser -D -s /usr/bin/git-shell git \
+         && sed -i 's/^git:!:/git:*:/' /etc/shadow
+    networks: [internal]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - ssh-keygen -A >/dev/null
+        && mkdir -p /home/git/.ssh && cp /keys/id_ed25519.pub /home/git/.ssh/authorized_keys
+        && chown -R git:git /home/git/.ssh /srv && chmod 700 /home/git/.ssh && chmod 600 /home/git/.ssh/authorized_keys
+        && exec /usr/sbin/sshd -D -e -o PasswordAuthentication=no -o PermitRootLogin=no -o AllowUsers=git
+    volumes:
+      - remote:/srv
+      - ${GIT_SECRETS_DIR}:/keys:ro
+    depends_on:
+      remote-init: { condition: service_completed_successfully }
+
+  # Seeds the bare remote with one note, as an agent pushing from elsewhere would.
+  remote-init:
+    image: docker.io/alpine/git:2.54.0@sha256:ac6c828f15d82775d204d3d75112e1d34af8945da80ccf922713c9891ba68e7a
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - set -e; [ -d /srv/notes.git ] && exit 0;
+        git init -q --bare -b main /srv/notes.git;
+        cd /tmp && git init -q -b main seed && cd seed;
+        mkdir -p agents && printf '# Rules\nBe brief.\n' > agents/digest.md && printf '# Index\n' > index.md;
+        git -c user.name=seed -c user.email=seed@test add -A && git -c user.name=seed -c user.email=seed@test commit -qm seed;
+        git push -q /srv/notes.git main;
+        chown -R 1000:1000 /srv/notes.git
+    environment: { HOME: /tmp }
+    volumes: [remote:/srv]
+
+  # Copies Caddy's internal root CA where the clients can trust it.
+  ca:
+    image: docker.io/library/caddy:2.11.7@sha256:36c24ad91a7ff7bc4c87fe22bfa8df3c4b18da0773d73fc12ee2c52b98c0bb7e
+    network_mode: none
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - for i in $(seq 1 60); do [ -f /src/caddy/pki/authorities/local/root.crt ] && cp /src/caddy/pki/authorities/local/root.crt /ca/root.crt && chmod 644 /ca/root.crt && exit 0; sleep 1; done; echo no CA; exit 1
+    volumes: [edge-data:/src:ro, ca:/ca]
+    depends_on:
+      edge: { condition: service_started }
+
+  # A phone: the LiveSync CLI set up from a Setup URI (e2e.sh runs it).
+  device:
+    image: ghcr.io/vrtmrz/livesync-cli:1.0.44-cli@sha256:e54b06dab7f97ad2b262e3f0328f8b44dc86cc0a68f303899d8afeaea1b0fbbe
+    profiles: [device]
+    # Root on a fresh volume: this is a stand-in for a phone, not a server.
+    user: "0:0"
+    networks: [internal]
+    environment:
+      NODE_EXTRA_CA_CERTS: /ca/root.crt
+      LIVESYNC_DB_PATH: /device
+      HOME: /tmp
+    tmpfs: [/tmp]
+    volumes: [ca:/ca:ro, device:/device]
+
+volumes:
+  remote: {}
+  ca: {}
+  device: {}

@@ -1,0 +1,34 @@
+# TLS for agent-notes (deploy/compose, profile edge). Certificates from
+# Let's Encrypt (ACME_EMAIL optional). Security headers on every response.
+{
+	email {$ACME_EMAIL}
+	admin off
+}
+
+(headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+}
+
+# Obsidian's LiveSync plugin, through the gate (Bearer to the notes database only).
+{$SYNC_HOST} {
+	import headers
+	reverse_proxy gate:5985
+}
+
+# The MCP server: OAuth, the approval page, /mcp.
+{$MCP_HOST} {
+	import headers
+	header X-Frame-Options DENY
+	reverse_proxy mcp:8000
+}
+
+# Obsidian in a browser, behind SSO (profile web).
+{$WEB_HOST} {
+	import headers
+	reverse_proxy oauth2-proxy:4180
+}

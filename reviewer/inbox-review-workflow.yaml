@@ -1,0 +1,91 @@
+# The hourly inbox review, for a SEPARATE automation repo (private), never the
+# notes repo itself: git-sync refuses a notes remote carrying hidden paths
+# such as .github/ (status=refused reason=unsafe_remote), so a workflow there
+# would stop the sync. docs/inbox.md has the steps.
+#
+# In the automation repo, owned by the same account as the notes repo:
+#   .github/workflows/inbox-review.yaml   this file
+#   reviewer/inbox_review.py              copied from agent-notes
+#   reviewer/test_inbox_review.py         copied from agent-notes
+# Settings of the automation repo:
+#   variable NOTES_REPO_NAME   the notes repo's name (same owner), e.g. "notes"
+#   secret ANTHROPIC_API_KEY   a key limited to this use, with a spend limit
+#   and one way to write to the notes repo, nothing wider:
+#   secret NOTES_REPO_TOKEN    a fine-grained token, this one repository only,
+#                              Contents read and write
+#   or a GitHub App with Contents read and write, installed on the notes repo
+#   only: variable NOTES_APP_CLIENT_ID and secret NOTES_APP_PRIVATE_KEY (a
+#   1-hour token per run, narrowed to the notes repo; used when set).
+#
+# Hourly and on demand (Actions tab, or: gh workflow run inbox-review.yaml).
+# An empty or unchanged inbox makes no model call. The model gets the items as
+# untrusted data and answers with verdicts only; the code does the moves. The
+# scripts come from this repo; the notes checkout is only data.
+name: inbox review
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Review and print, write nothing"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: inbox-review
+  cancel-in-progress: false
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      VAULT_DIR: ${{ github.workspace }}/notes
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: Red-team test of the reviewer (offline, before any token is used)
+        run: python3 reviewer/test_inbox_review.py
+      - name: GitHub App token for the notes repo (when the app is configured)
+        id: app
+        if: vars.NOTES_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.NOTES_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NOTES_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.NOTES_REPO_NAME }}
+          permission-contents: write
+      - name: The notes repo, into notes/
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/${{ vars.NOTES_REPO_NAME }}
+          token: ${{ steps.app.outputs.token || secrets.NOTES_REPO_TOKEN }}
+          path: notes
+      - name: Anthropic SDK
+        run: python3 -m pip install --quiet --disable-pip-version-check "anthropic==1.16.0"
+      - name: Review
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 reviewer/inbox_review.py > "$RUNNER_TEMP/inbox.json"
+          { echo '### Inbox'; echo '```json'; cat "$RUNNER_TEMP/inbox.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit and push to the notes repo
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.dry_run != 'true'
+        working-directory: notes
+        run: |
+          set -euo pipefail
+          git add -A
+          git diff --cached --quiet && { echo "nothing to commit"; exit 0; }
+          n=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["promoted"]))' "$RUNNER_TEMP/inbox.json")
+          git -c user.name="inbox review" -c user.email="inbox-review@users.noreply.github.com" commit -qm "notes: inbox review, $n promoted"
+          # git-sync pushes every 30 s: rebase and retry on a race. An item
+          # edited meanwhile makes the rebase fail: nothing is pushed, and the
+          # next run judges the new text.
+          for i in 1 2 3; do
+            git push -q && exit 0
+            git pull -q --rebase || { git rebase --abort 2>/dev/null || true; exit 1; }
+          done
+          exit 1

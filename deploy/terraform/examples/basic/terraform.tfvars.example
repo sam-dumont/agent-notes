@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars (gitignored). Sample values only.
+kube_context = "my-cluster"
+
+hosts = {
+  sync = "sync.example.com"
+  mcp  = "notes-mcp.example.com"
+}
+
+oidc = {
+  issuer    = "https://idp.example.com"
+  client_id = "agent-notes"
+}
+oidc_client_secret = "from-your-provider"
+allowed_subs       = ["your-sub-at-the-provider"]
+
+git_remote = "https://github.com/you/notes.git"
+git_token  = "github_pat_with_contents_write_on_that_repo"
+
+# scripts/device-key.sh <name> writes devices/<name>.pub
+devices = {
+  # phone = file("../../../../devices/phone.pub")
+}
