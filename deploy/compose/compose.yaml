@@ -1,0 +1,376 @@
+# agent-notes on one machine: Docker Compose.
+#
+#   cp .env.example .env && ../../scripts/init-env.sh .env   # random secrets, nothing printed
+#   $EDITOR .env                                             # hostnames, OIDC client, your sub
+#   docker compose up -d
+#
+# What runs (docs/architecture.md):
+#
+#   Obsidian --TLS--> edge --> gate :5985 --> couchdb <--> livesync --+
+#   agents   --git--> your git remote <------------------- git-sync --+-- the notes volume
+#   MCP clients --TLS--> edge --> mcp ---------------------------------+
+#   browser  --TLS--> edge --> oauth2-proxy --> gate :8081 --> web ----+
+#
+# Only `edge` publishes ports. Everything else talks on the internal network.
+# Every container runs as a non-root user with a read-only root filesystem
+# and no capabilities, except the two one-shot steps that set up the volumes.
+
+name: agent-notes
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  networks: [internal]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  # One-shot: the folders on the notes volume, owned by uid 1000 (the
+  # daemon, git-sync, the MCP server and the web app all run as 1000).
+  prepare:
+    image: docker.io/alpine/git:2.54.0@sha256:ac6c828f15d82775d204d3d75112e1d34af8945da80ccf922713c9891ba68e7a
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mkdir -p /vault/shared/notes /vault/shared/tmp /vault/git /vault/livesync /vault/state /vault/ignis /vault/obsidian-app
+        && chown 1000:1000 /vault/shared /vault/shared/notes /vault/shared/tmp /vault/git /vault/livesync /vault/state /vault/ignis /vault/obsidian-app
+        && chmod 700 /vault/git /vault/livesync /vault/state /vault/ignis
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    network_mode: none
+    volumes: [vault:/vault]
+
+  # The server image is built from this checkout by default
+  # (agent-notes-server:local), never pulled from a moving tag. To use a
+  # published image, set AGENT_NOTES_IMAGE to a release pinned by digest and
+  # check its provenance first: gh attestation verify oci://<image> -R sam-dumont/agent-notes
+
+  # One-shot: CouchDB's ini (device keys) and the daemon's settings, from .env
+  # and devices/*.pub. Rerun by `docker compose up -d` after adding a device.
+  render:
+    # CouchDB's files are owned by uid 5984, 0755/0644 (public keys and a uuid
+    # only): its entrypoint re-owns and re-modes anything under /opt/couchdb
+    # that isn't, and fails on this read-only mount.
+    image: ${AGENT_NOTES_IMAGE:-agent-notes-server:local}
+    build: { context: ../.., dockerfile: server/Dockerfile }
+    read_only: true
+    network_mode: none
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - python /app/render_config.py
+        && chown 5984:5984 /config/couchdb /config/couchdb/10-agent-notes.ini && chmod 755 /config/couchdb && chmod 644 /config/couchdb/10-agent-notes.ini
+        && chown -R 1000:1000 /config/livesync && chmod 700 /config/livesync && chmod 600 /config/livesync/settings.json
+        && if [ -f /config/web/emails ]; then chmod 755 /config/web && chmod 644 /config/web/emails; fi
+    environment:
+      COUCHDB_UUID: ${COUCHDB_UUID:?run scripts/init-env.sh}
+      COUCHDB_DATABASE: ${COUCHDB_DATABASE:-notes}
+      LIVESYNC_PASSWORD: ${LIVESYNC_PASSWORD:?run scripts/init-env.sh}
+      E2E_PASSPHRASE: ${E2E_PASSPHRASE:?run scripts/init-env.sh}
+      WEB_ALLOWED_EMAIL: ${WEB_ALLOWED_EMAIL:-}
+      DEVICES_DIR: /devices
+      OUT_DIR: /config
+    volumes:
+      - ${DEVICES_DIR:-../../devices}:/devices:ro
+      - config:/config
+
+  couchdb:
+    <<: *hardened
+    image: docker.io/library/couchdb:3.5.3@sha256:bed314d10cdf58c0fff63352db4c3f168df58a185a773c0e2295105375c5ef10
+    # The image's entrypoint writes the admin hash to local.d, then drops to
+    # uid 5984 with gosu: it needs root and these capabilities to do that.
+    read_only: false
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: ${COUCHDB_ADMIN_PASSWORD:?run scripts/init-env.sh}
+      COUCHDB_SECRET: ${COUCHDB_COOKIE_SECRET:?run scripts/init-env.sh}
+      # Erlang sizes its port table from the open-file limit; where that is
+      # huge (some container runtimes: ~1e9) CouchDB is OOM-killed at boot.
+      ERL_FLAGS: "+Q 65536"
+    volumes:
+      - couchdb:/opt/couchdb/data
+      - { type: volume, source: config, target: /opt/couchdb/etc/default.d, read_only: true, volume: { subpath: couchdb } }
+    depends_on:
+      render: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:5984/_up"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: the notes database, the daemon's user, the database's members.
+  couchdb-setup:
+    <<: *hardened
+    image: docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+    restart: "no"
+    user: "100:101"
+    entrypoint: ["/bin/sh", "/scripts/couchdb-setup.sh"]
+    environment:
+      COUCH: http://couchdb:5984
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: ${COUCHDB_ADMIN_PASSWORD}
+      LIVESYNC_PASSWORD: ${LIVESYNC_PASSWORD}
+      COUCHDB_DATABASE: ${COUCHDB_DATABASE:-notes}
+      JWT_SUB: ${JWT_SUB:-owner}
+      TMPDIR: /tmp
+    tmpfs: [/tmp]
+    volumes:
+      - ../../sync/couchdb-setup.sh:/scripts/couchdb-setup.sh:ro
+    depends_on:
+      couchdb: { condition: service_healthy }
+
+  # CouchDB <-> the notes folder. Same sync core as the Obsidian plugin.
+  livesync:
+    <<: *hardened
+    image: ghcr.io/vrtmrz/livesync-cli:1.0.44-cli@sha256:e54b06dab7f97ad2b262e3f0328f8b44dc86cc0a68f303899d8afeaea1b0fbbe
+    user: "1000:1000"
+    command: ["--settings", "/etc/livesync/settings.json", "--vault", "/vault/notes", "daemon"]
+    environment:
+      LIVESYNC_DB_PATH: /vault/livesync
+      HOME: /tmp
+    tmpfs: [/tmp]
+    # Each container mounts only its part of the volume: the daemon never
+    # sees the git dir (git-sync's hooks and config) or the MCP state.
+    volumes:
+      - { type: volume, source: vault, target: /vault/notes, volume: { subpath: shared/notes } }
+      - { type: volume, source: vault, target: /vault/livesync, volume: { subpath: livesync } }
+      - { type: volume, source: config, target: /etc/livesync, read_only: true, volume: { subpath: livesync } }
+    depends_on:
+      prepare: { condition: service_completed_successfully }
+      couchdb-setup: { condition: service_completed_successfully }
+
+  # The notes folder <-> your git remote, every 30 s.
+  git-sync:
+    <<: *hardened
+    image: docker.io/alpine/git:2.54.0@sha256:ac6c828f15d82775d204d3d75112e1d34af8945da80ccf922713c9891ba68e7a
+    user: "1000:1000"
+    networks: [egress]
+    entrypoint: ["/bin/sh", "/scripts/git-sync.sh"]
+    environment:
+      GIT_DIR: /vault/git
+      GIT_WORK_TREE: /vault/notes
+      NOTES_REMOTE: ${GIT_REMOTE:?set GIT_REMOTE in .env}
+      NOTES_BRANCH: ${GIT_BRANCH:-main}
+      GIT_TOKEN_FILE: ${GIT_TOKEN_FILE:-}
+      GIT_SSH_KEY: ${GIT_SSH_KEY:-}
+      GIT_SSH_KNOWN_HOSTS: ${GIT_SSH_KNOWN_HOSTS:-}
+      HOME: /tmp
+      GIT_AUTHOR_NAME: agent-notes
+      GIT_AUTHOR_EMAIL: agent-notes@localhost
+      GIT_COMMITTER_NAME: agent-notes
+      GIT_COMMITTER_EMAIL: agent-notes@localhost
+    tmpfs: [/tmp]
+    volumes:
+      - { type: volume, source: vault, target: /vault/notes, volume: { subpath: shared/notes } }
+      - { type: volume, source: vault, target: /vault/git, volume: { subpath: git } }
+      - ../../sync/git-sync.sh:/scripts/git-sync.sh:ro
+      # ssh refuses to run for a uid with no passwd entry (alpine/git has none for 1000).
+      - ../../sync/git-sync.passwd:/etc/passwd:ro
+      - gh-token:/run/git:ro
+      - ${GIT_SECRETS_DIR:-../../secrets/git}:/secrets/git:ro
+    depends_on:
+      prepare: { condition: service_completed_successfully }
+
+  # Optional (profile github-app): a 1-hour GitHub App token for git-sync,
+  # instead of a long-lived personal token. GIT_TOKEN_FILE=/run/git/token.
+  gh-app-token:
+    <<: *hardened
+    profiles: [github-app]
+    image: ${AGENT_NOTES_IMAGE:-agent-notes-server:local}
+    user: "1000:1000"
+    entrypoint: ["python", "/app/gh_app_token.py"]
+    networks: [egress]
+    environment:
+      GH_APP_ID: ${GH_APP_ID:-}
+      GH_APP_INSTALLATION_ID: ${GH_APP_INSTALLATION_ID:-}
+      GH_APP_REPO: ${GH_APP_REPO:-}
+      GH_APP_KEY_FILE: /secrets/git/github-app.pem
+      TOKEN_FILE: /run/git/token
+    volumes:
+      - gh-token:/run/git
+      - ${GIT_SECRETS_DIR:-../../secrets/git}:/secrets/git:ro
+
+  # The MCP server.
+  mcp:
+    <<: *hardened
+    image: ${AGENT_NOTES_IMAGE:-agent-notes-server:local}
+    build: { context: ../.., dockerfile: server/Dockerfile }
+    user: "1000:1000"
+    networks: [internal, egress]
+    environment:
+      AGENT_NOTES_NAME: ${AGENT_NOTES_NAME:-agent-notes}
+      AGENT_NOTES_BASE_URL: https://${MCP_HOST:?set MCP_HOST in .env}
+      AGENT_NOTES_ROOT: /vault/notes
+      AGENT_NOTES_TMP: /vault/tmp
+      AGENT_NOTES_STATE_DIR: /state
+      AGENT_NOTES_ALLOWED_SUBS: ${AGENT_NOTES_ALLOWED_SUBS:?your OIDC sub, see docs/oidc.md}
+      AGENT_NOTES_JWT_SIGNING_KEY: ${AGENT_NOTES_JWT_SIGNING_KEY:?run scripts/init-env.sh}
+      AGENT_NOTES_STORAGE_KEY: ${AGENT_NOTES_STORAGE_KEY:?run scripts/init-env.sh}
+      AGENT_NOTES_WRITE_PREFIXES: ${AGENT_NOTES_WRITE_PREFIXES:-inbox/}
+      AGENT_NOTES_APPEND_PREFIXES: ${AGENT_NOTES_APPEND_PREFIXES:-inbox/}
+      AGENT_NOTES_PRIVATE_PREFIXES: ${AGENT_NOTES_PRIVATE_PREFIXES:-}
+      AGENT_NOTES_TRUSTED_CLIENTS: ${AGENT_NOTES_TRUSTED_CLIENTS:-}
+      AGENT_NOTES_TRUST_LOOPBACK: ${AGENT_NOTES_TRUST_LOOPBACK:-}
+      AGENT_NOTES_RULES_PATH: ${AGENT_NOTES_RULES_PATH:-agents/digest.md}
+      AGENT_NOTES_DEVICE_KEYS: ${AGENT_NOTES_DEVICE_KEYS:-}
+      AGENT_NOTES_STRONG_AMR: ${AGENT_NOTES_STRONG_AMR:-mfa,phr,phrh}
+      AGENT_NOTES_STRONG_ACR: ${AGENT_NOTES_STRONG_ACR:-}
+      AGENT_NOTES_ACR_VALUES: ${AGENT_NOTES_ACR_VALUES:-}
+      AGENT_NOTES_METHODS_CLAIM: ${AGENT_NOTES_METHODS_CLAIM:-}
+      OIDC_ISSUER: ${OIDC_ISSUER:?set OIDC_ISSUER in .env}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?set OIDC_CLIENT_ID in .env}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?set OIDC_CLIENT_SECRET in .env}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: agent-notes
+    # notes and tmp share one mount (writes are a rename from tmp into notes);
+    # the state is separate; no git dir, no daemon database.
+    volumes:
+      - { type: volume, source: vault, target: /vault, volume: { subpath: shared } }
+      - { type: volume, source: vault, target: /state, volume: { subpath: state } }
+    depends_on:
+      prepare: { condition: service_completed_successfully }
+
+  # Obsidian in a browser (Ignis), optional (profile web). The app bundle is
+  # Obsidian's own, fetched from Obsidian's releases and checked by SHA-256.
+  obsidian-fetch:
+    <<: *hardened
+    profiles: [web]
+    image: docker.io/nobbe/ignis:0.8.18@sha256:8faba2774dd9069360aedbf9ace87cdf926c454ccee56a2d7bc5ff7556737567
+    restart: "no"
+    user: "1000:1000"
+    networks: [egress]
+    entrypoint: ["/bin/sh", "/scripts/obsidian-fetch.sh"]
+    depends_on:
+      prepare: { condition: service_completed_successfully }
+    environment:
+      OBSIDIAN_VERSION: "1.14.4"
+      OBSIDIAN_SHA256: d1ed428c363968774f0f3906e67d8a53a058ece0b6cdd924b07865977b2ada21
+      HOME: /tmp
+      npm_config_cache: /tmp/npm
+    tmpfs: [/tmp]
+    volumes:
+      - { type: volume, source: vault, target: /app/obsidian-app, volume: { subpath: obsidian-app } }
+      - ../../sync/obsidian-fetch.sh:/scripts/obsidian-fetch.sh:ro
+      - ../../sync/asar:/scripts/asar:ro
+
+  web:
+    <<: *hardened
+    profiles: [web]
+    image: docker.io/nobbe/ignis:0.8.18@sha256:8faba2774dd9069360aedbf9ace87cdf926c454ccee56a2d7bc5ff7556737567
+    user: "1000:1000"
+    # Skips the image's entrypoint (root: useradd, chown, gosu) and Obsidian
+    # Sync's headless client, which this setup doesn't use.
+    entrypoint: ["node", "/app/apps/ignis-server/server/index.js"]
+    environment:
+      VAULT_ROOT: /vaults
+      DATA_ROOT: /app/data
+      OBSIDIAN_ASSETS_PATH: /app/obsidian-app
+      PORT: "8080"
+      HOME: /tmp
+      WS_ORIGINS: https://${WEB_HOST:-web.invalid}
+    tmpfs: [/tmp]
+    volumes:
+      - { type: volume, source: vault, target: /vaults/notes, volume: { subpath: shared/notes } }
+      - { type: volume, source: vault, target: /app/data, volume: { subpath: ignis } }
+      - { type: volume, source: vault, target: /app/obsidian-app, read_only: true, volume: { subpath: obsidian-app } }
+    # Ignis has no login: it never runs without oauth2-proxy, even when started
+    # by name (`docker compose up web` would otherwise start it alone).
+    depends_on:
+      obsidian-fetch: { condition: service_completed_successfully }
+      oauth2-proxy: { condition: service_started }
+
+  # SSO in front of the web app. Any OIDC provider; only the allowed email
+  # gets through (Ignis has no login of its own).
+  oauth2-proxy:
+    <<: *hardened
+    profiles: [web]
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916
+    user: "65532:65532"
+    networks: [internal, egress]
+    environment:
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_OIDC_ISSUER_URL: ${OIDC_ISSUER}
+      OAUTH2_PROXY_CLIENT_ID: ${OIDC_WEB_CLIENT_ID:-${OIDC_CLIENT_ID}}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OIDC_WEB_CLIENT_SECRET:-${OIDC_CLIENT_SECRET}}
+      OAUTH2_PROXY_REDIRECT_URL: https://${WEB_HOST:-web.invalid}/oauth2/callback
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?run scripts/init-env.sh}
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      # No EMAIL_DOMAINS: "*" there admits every account at the provider and
+      # the emails file is never consulted. The file alone decides.
+      OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE: /etc/oauth2-proxy/emails
+      OAUTH2_PROXY_UPSTREAMS: http://gate:8081/
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
+    volumes:
+      - { type: volume, source: config, target: /etc/oauth2-proxy, read_only: true, volume: { subpath: web } }
+    depends_on:
+      render: { condition: service_completed_successfully }
+
+  # The only way from outside to CouchDB and the web app (sync/gate.Caddyfile).
+  gate:
+    <<: *hardened
+    image: docker.io/library/caddy:2.11.7@sha256:36c24ad91a7ff7bc4c87fe22bfa8df3c4b18da0773d73fc12ee2c52b98c0bb7e
+    user: "1000:1000"
+    # The caddy binary carries the net_bind_service file capability: without
+    # it in the bounding set, exec fails. It binds no privileged port here.
+    cap_add: [NET_BIND_SERVICE]
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      COUCHDB_DATABASE: ${COUCHDB_DATABASE:-notes}
+      COUCHDB_UPSTREAM: couchdb:5984
+      IGNIS_UPSTREAM: web:8080
+      XDG_DATA_HOME: /tmp
+      XDG_CONFIG_HOME: /tmp
+    tmpfs: [/tmp]
+    volumes:
+      - ../../sync/gate.Caddyfile:/etc/caddy/Caddyfile:ro
+
+  # TLS for the three hostnames (Let's Encrypt by default). Skip it (profile
+  # off: docker compose up with COMPOSE_PROFILES without "edge") if your own
+  # reverse proxy terminates TLS: point it at gate:5985, mcp:8000 and
+  # oauth2-proxy:4180 (never gate:8081: that is Ignis with no login), and keep
+  # the gate in the path.
+  edge:
+    <<: *hardened
+    profiles: [edge]
+    image: docker.io/library/caddy:2.11.7@sha256:36c24ad91a7ff7bc4c87fe22bfa8df3c4b18da0773d73fc12ee2c52b98c0bb7e
+    cap_add: [NET_BIND_SERVICE]
+    networks: [internal, egress]
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      SYNC_HOST: ${SYNC_HOST:?set SYNC_HOST in .env}
+      MCP_HOST: ${MCP_HOST}
+      WEB_HOST: ${WEB_HOST:-web.invalid}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      XDG_DATA_HOME: /data
+      XDG_CONFIG_HOME: /config
+    volumes:
+      - ./edge.Caddyfile:/etc/caddy/Caddyfile:ro
+      - edge-data:/data
+      - edge-config:/config
+
+networks:
+  # No route out: CouchDB, the daemon, the gate and the web app never need one.
+  internal:
+    internal: true
+  egress: {}
+
+volumes:
+  vault: {}
+  couchdb: {}
+  config: {}
+  gh-token:
+    driver_opts: { type: tmpfs, device: tmpfs, o: "uid=1000,gid=1000,mode=0700" }
+  edge-data: {}
+  edge-config: {}

@@ -1,0 +1,42 @@
+# ~/.config/agent-notes/hooks.toml: where the notes are, which repos map to which project.
+
+[notes]
+# Exactly one of these two:
+clone = "~/notes"                 # a local git clone of the notes: commit + push
+# github = "you/notes"            # or the repo itself, through `gh api` (your gh login)
+branch = "main"
+rules_path = "agents/digest.md"   # injected at the start of every session in scope
+
+[projects]
+# Repo (or folder) -> project name: log/<name>.md and handoffs/<name>.md. Longest prefix wins;
+# a worktree counts as its repo.
+"~/code/my-app" = "my-app"
+"~/code/homelab" = "homelab"
+
+[scope]
+# Sessions anywhere under these get the rules digest, mapped or not.
+roots = ["~/code"]
+# Sessions under these get nothing and are never logged (a client's code under their own rules).
+exclude = ["~/code/clients"]
+
+[summary]
+enabled = true
+model = "haiku"                   # any model name `claude -p --model` accepts
+min_user_messages = 2
+
+[redact]
+# Applied to everything the hooks write, after the built-in rules (keys, tokens, JWTs,
+# emails, IP addresses, long opaque strings). Python regexes.
+patterns = [
+  "(?i)\\bproject-codename\\b",
+  "[€$£]\\s?\\d[\\d.,]*",
+]
+
+[device]
+# For mcp-device-header / enroll-device (optional: docs/devices.md in the repo).
+kid = "laptop"
+key = "keychain"                  # macOS Keychain; elsewhere "file:~/.config/agent-notes/device.key"
+
+[device.servers]
+# Only these servers get a device token; the value is the server's AGENT_NOTES_NAME.
+"https://notes-mcp.example.com" = "agent-notes"

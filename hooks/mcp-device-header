@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Claude Code headersHelper for agent-notes: prints {"X-MCP-Device": <token>} for the MCP
+servers listed in [device.servers] (hooks.toml), {} for any other server.
+
+Claude Code runs it at each MCP connection, with CLAUDE_CODE_MCP_SERVER_URL set, and times out
+after 10 s. A failure prints {} (the session falls back to the restricted tier, it isn't
+blocked) and leaves one line in ~/.local/state/agent-notes/hooks.log. See device_token.py.
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import device_token as dt  # noqa: E402
+
+
+def main() -> None:
+    try:
+        cfg = dt.DeviceConfig.load()
+        aud = cfg.audience_for(os.environ.get("CLAUDE_CODE_MCP_SERVER_URL", ""))
+        if not aud:
+            print("{}")
+            return
+        print(json.dumps({"X-MCP-Device": dt.sign_token(dt.load_key(cfg), cfg.kid, aud)}))
+    except Exception as e:  # noqa: BLE001 - never block a connection
+        try:
+            d = Path(os.environ.get("AGENT_NOTES_STATE_DIR") or Path.home() / ".local/state/agent-notes")
+            d.mkdir(parents=True, exist_ok=True)
+            with (d / "hooks.log").open("a") as f:
+                f.write(f"mcp-device-header: {type(e).__name__}: {str(e)[:200]}\n")
+        except OSError:
+            pass
+        print("{}")
+
+
+if __name__ == "__main__":
+    main()

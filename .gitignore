@@ -1,0 +1,17 @@
+# Secrets: never committed.
+.env
+deploy/compose/.env
+secrets/
+*.key
+*.pem
+# Device public keys are yours to keep in a private fork, not in this repo.
+devices/
+# Local tooling
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan

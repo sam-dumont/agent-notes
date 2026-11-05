@@ -1,0 +1,8 @@
+# The server image's build context is the repo root; send it only what it uses.
+*
+!server/*.py
+!server/requirements.txt
+!server/requirements-dev.txt
+!sync/couchdb.ini.tmpl
+!reviewer/inbox_review.py
+!reviewer/test_inbox_review.py

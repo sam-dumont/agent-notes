@@ -1,0 +1,10 @@
+{
+  "name": "agent-notes-setup-uri",
+  "private": true,
+  "type": "module",
+  "description": "Builds a Self-hosted LiveSync Setup URI for one device (scripts/device-key.sh first)",
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "@vrtmrz/livesync-commonlib": "0.2.3"
+  }
+}

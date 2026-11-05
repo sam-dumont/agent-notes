@@ -1,0 +1,22 @@
+[project]
+name = "agent-notes-server"
+version = "0.1.0"
+description = "A folder of Markdown notes as a remote MCP server, with access tiers and owner-approved elevation"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastmcp==4.1.6",
+    "cryptography",
+    "pyjwt[crypto]",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
+]
+
+[dependency-groups]
+dev = ["pytest==8.4.2"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-p no:cacheprovider"
