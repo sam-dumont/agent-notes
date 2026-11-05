@@ -118,3 +118,18 @@ scheduled job's model as the judge, nothing else changes.
 Even promoted, a handoff was written by an earlier session. The session hook
 (`hooks/`) injects it fenced and labelled as quoted data, with a reminder that
 it is context, not instructions, and never a reason to run a command.
+
+There is one handoff per project. Two worktrees of the same repo, in parallel
+sessions, overwrite each other's: the latest one may be about the other
+branch's work. The hook says so when the handoff's branch isn't the one the
+session starts on; every session is still in `log/<project>.md`.
+
+## Search skips the inbox
+
+`search_notes` leaves `inbox/` out unless the `folder` argument is inside it.
+Without that, a later session searching a project term would read a pending
+or held item's lines next to reviewed notes, looking the same, and the review
+would only guard the startup context. A search inside `inbox/` is a choice,
+and its hits carry `"unreviewed": true`. `read_note` and `list_notes` still
+reach the inbox for any reader: an agent that goes looking for it finds it,
+as data.

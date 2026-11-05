@@ -491,15 +491,25 @@ def build_server(
 
     @mcp.tool
     async def search_notes(query: str, folder: str = "", grant: str = "") -> list[dict]:
-        """Case-insensitive search in note names and contents. Returns matching paths with a few matching lines each."""
+        """Case-insensitive search in note names and contents. Returns matching paths with a few matching lines each.
+        The inbox (unreviewed text from restricted sessions) is left out unless `folder` is inside it; its hits then
+        carry "unreviewed": true."""
         who = await resolve(grant)
         q = query.strip()
         if len(q) < 2:
             raise NoteError("query too short")
         pattern = re.compile(re.escape(q), re.IGNORECASE)
+        # A plain search would otherwise hand a later session lines that no
+        # review has read yet, next to reviewed notes and looking the same:
+        # the inbox's whole point is that its text reaches the next session
+        # only through promotion. Asking for inbox/ by name is a choice, and
+        # those hits say what they are.
+        in_inbox = bool(folder) and Writers.is_inbox(vault.rel(vault.resolve(folder, must_be_note=False)) + "/")
         hits = []
         for f in readable(who, vault.notes(folder)):
             rel = vault.rel(f)
+            if Writers.is_inbox(rel) and not in_inbox:
+                continue
             lines = []
             try:
                 for n, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
@@ -510,7 +520,7 @@ def build_server(
             except OSError:
                 continue
             if lines or pattern.search(rel):
-                hits.append({"path": rel, "matches": lines})
+                hits.append({"path": rel, "matches": lines, **({"unreviewed": True} if Writers.is_inbox(rel) else {})})
                 if len(hits) >= MAX_SEARCH_FILES:
                     break
         audit("search", who, folder=folder, hits=len(hits))

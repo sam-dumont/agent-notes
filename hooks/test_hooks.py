@@ -383,6 +383,24 @@ def test_handoff_is_injected_as_fenced_data():
     assert "```" not in fence.split("\n```\n", 1)[0], "the handoff can't close the fence early"
 
 
+def test_a_handoff_from_another_branch_says_so(monkeypatch):
+    import agent_notes_hooks as h
+
+    class Store:
+        def get(self, path):
+            if path.endswith("digest.md"):
+                return "# Rules\nBe brief.", None
+            return ("## Where it stopped\nhotfix built\n## Next step\nPublish the hotfix.\n## Open questions\n- none\n"
+                    "## Repo state\n- Branch `hotfix/login`, last commit `abc1234` fix\n"), None
+
+    cfg = h.Config(**{**h.Config().__dict__, "projects": {"/w": "proj"}})
+    monkeypatch.setattr(h, "current_branch", lambda cwd: "migration")
+    ctx = h.start_context(cfg, {"cwd": "/w/repo"}, store=Store())
+    assert "written on branch `hotfix/login`, and this session is on `migration`" in ctx
+    monkeypatch.setattr(h, "current_branch", lambda cwd: "hotfix/login")
+    assert "written on branch" not in h.start_context(cfg, {"cwd": "/w/repo"}, store=Store())
+
+
 def test_handoff_without_sections_injects_nothing():
     import agent_notes_hooks as h
 

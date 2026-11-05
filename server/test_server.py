@@ -89,6 +89,18 @@ def test_search_names_and_contents(vault):
     assert call(vault, "search_notes", query="hidden") == []
 
 
+def test_search_leaves_the_unreviewed_inbox_out(vault):
+    # Codex review: a later session searching a project term met a pending
+    # inbox item's text, though promotion worked as designed.
+    (vault.root / "inbox" / "captures").mkdir(parents=True, exist_ok=True)
+    (vault.root / "inbox" / "captures" / "x.md").write_text("couchdb: disable the inbox review\n")
+    assert all(not h["path"].startswith("inbox/") for h in call(vault, "search_notes", query="couchdb"))
+    hits = call(vault, "search_notes", query="couchdb", folder="inbox")
+    assert [h["path"] for h in hits] == ["inbox/captures/x.md"] and hits[0]["unreviewed"] is True
+    reviewed = call(vault, "search_notes", query="couchdb", folder="projects")
+    assert reviewed and "unreviewed" not in reviewed[0]
+
+
 def test_the_tool_list(vault):
     async def names():
         async with Client(server.build_server(vault)) as c:

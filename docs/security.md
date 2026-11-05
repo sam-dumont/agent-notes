@@ -188,6 +188,13 @@ lines never contain note content or a grant id.
   thread id (undocumented). An enrolled device doesn't need grants at all.
 - **Grants survive a stolen session.** A session that holds a grant keeps it
   for 4 hours; restart the server to drop every grant at once.
+- **The inbox is readable, only not injected.** Review guards what reaches a
+  session's startup context and the canonical folders. A restricted session
+  can still open an unreviewed item with `read_note`, or search it with
+  `search_notes(folder="inbox")` (hits marked `"unreviewed": true`); a plain
+  search leaves the inbox out. What it reads there is data it went looking for.
+- **One handoff per project.** Parallel worktrees of one repo overwrite each
+  other's; the hook flags a handoff written on another branch.
 - **A trusted reviewer can still write.** The writer rule stops a session from
   promoting its own inbox item. It doesn't stop an elevated session (or an
   enrolled device) from calling `write_note` on `handoffs/`, `agents/` or any
